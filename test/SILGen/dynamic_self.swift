@@ -43,9 +43,9 @@ class GY<T> : GX<[T]> { }
 // CHECK:   [[BORROWED_Y_AS_X:%[0-9]+]] = upcast [[BORROWED_Y]] : $Y to $X
 // CHECK:   [[X_F:%[0-9]+]] = class_method [[BORROWED_Y_AS_X]] : $X, #X.f!1 : (X) -> () -> @dynamic_self X, $@convention(method) (@guaranteed X) -> @owned X
 // CHECK:   [[X_RESULT:%[0-9]+]] = apply [[X_F]]([[BORROWED_Y_AS_X]]) : $@convention(method) (@guaranteed X) -> @owned X
+// CHECK:   end_borrow [[BORROWED_Y]] from [[Y]]
 // CHECK:   [[Y_RESULT:%[0-9]+]] = unchecked_ref_cast [[X_RESULT]] : $X to $Y
 // CHECK:   destroy_value [[Y_RESULT]] : $Y
-// CHECK:   end_borrow [[BORROWED_Y]] from [[Y]]
 // CHECK:   destroy_value [[Y]] : $Y
 func testDynamicSelfDispatch(y: Y) {
   _ = y.f()
@@ -58,9 +58,9 @@ func testDynamicSelfDispatchGeneric(gy: GY<Int>) {
   // CHECK:   [[BORROWED_GY_AS_GX:%[0-9]+]] = upcast [[BORROWED_GY]] : $GY<Int> to $GX<Array<Int>>
   // CHECK:   [[GX_F:%[0-9]+]] = class_method [[BORROWED_GY_AS_GX]] : $GX<Array<Int>>, #GX.f!1 : <T> (GX<T>) -> () -> @dynamic_self GX<T>, $@convention(method) <τ_0_0> (@guaranteed GX<τ_0_0>) -> @owned GX<τ_0_0>
   // CHECK:   [[GX_RESULT:%[0-9]+]] = apply [[GX_F]]<[Int]>([[BORROWED_GY_AS_GX]]) : $@convention(method) <τ_0_0> (@guaranteed GX<τ_0_0>) -> @owned GX<τ_0_0>
+  // CHECK:   end_borrow [[BORROWED_GY]] from [[GY]]
   // CHECK:   [[GY_RESULT:%[0-9]+]] = unchecked_ref_cast [[GX_RESULT]] : $GX<Array<Int>> to $GY<Int>
   // CHECK:   destroy_value [[GY_RESULT]] : $GY<Int>
-  // CHECK:   end_borrow [[BORROWED_GY]] from [[GY]]
   // CHECK:   destroy_value [[GY]]
   _ = gy.f()
 }
@@ -68,8 +68,8 @@ func testDynamicSelfDispatchGeneric(gy: GY<Int>) {
 // CHECK-LABEL: sil hidden @_T012dynamic_self21testArchetypeDispatch{{[_0-9a-zA-Z]*}}F : $@convention(thin) <T where T : P> (@in T) -> ()
 func testArchetypeDispatch<T: P>(t: T) {
   // CHECK: bb0([[T:%[0-9]+]] : $*T):
-  // CHECK:   [[ARCHETYPE_F:%[0-9]+]] = witness_method $T, #P.f!1 : {{.*}} : $@convention(witness_method: P) <τ_0_0 where τ_0_0 : P> (@in_guaranteed τ_0_0) -> @out τ_0_0
   // CHECK:   [[T_RESULT:%[0-9]+]] = alloc_stack $T
+  // CHECK:   [[ARCHETYPE_F:%[0-9]+]] = witness_method $T, #P.f!1 : {{.*}} : $@convention(witness_method: P) <τ_0_0 where τ_0_0 : P> (@in_guaranteed τ_0_0) -> @out τ_0_0
   // CHECK:   [[SELF_RESULT:%[0-9]+]] = apply [[ARCHETYPE_F]]<T>([[T_RESULT]], [[T]]) : $@convention(witness_method: P) <τ_0_0 where τ_0_0 : P> (@in_guaranteed τ_0_0) -> @out τ_0_0
   _ = t.f()
 }
@@ -128,8 +128,7 @@ func testObjCInit(meta: ObjCInit.Type) {
 // CHECK: bb0([[THICK_META:%[0-9]+]] : $@thick ObjCInit.Type):
 // CHECK:   [[OBJC_META:%[0-9]+]] = thick_to_objc_metatype [[THICK_META]] : $@thick ObjCInit.Type to $@objc_metatype ObjCInit.Type
 // CHECK:   [[OBJ:%[0-9]+]] = alloc_ref_dynamic [objc] [[OBJC_META]] : $@objc_metatype ObjCInit.Type, $ObjCInit
-// CHECK:   [[BORROWED_OBJ:%.*]] = begin_borrow [[OBJ]]
-// CHECK:   [[INIT:%[0-9]+]] = objc_method [[BORROWED_OBJ]] : $ObjCInit, #ObjCInit.init!initializer.1.foreign : (ObjCInit.Type) -> () -> ObjCInit, $@convention(objc_method) (@owned ObjCInit) -> @owned ObjCInit
+// CHECK:   [[INIT:%[0-9]+]] = objc_method [[OBJ]] : $ObjCInit, #ObjCInit.init!initializer.1.foreign : (ObjCInit.Type) -> () -> ObjCInit, $@convention(objc_method) (@owned ObjCInit) -> @owned ObjCInit
 // CHECK:   [[RESULT_OBJ:%[0-9]+]] = apply [[INIT]]([[OBJ]]) : $@convention(objc_method) (@owned ObjCInit) -> @owned ObjCInit
 // CHECK:   [[RESULT:%[0-9]+]] = tuple ()
 // CHECK:   return [[RESULT]] : $()
@@ -162,6 +161,7 @@ func testOptionalResult(v : OptionalResultInheritor) {
 // CHECK:      [[CAST_BORROWED_ARG:%.*]] = upcast [[BORROWED_ARG]]
 // CHECK:      [[T0:%.*]] = class_method [[CAST_BORROWED_ARG]] : $OptionalResult, #OptionalResult.foo!1 : (OptionalResult) -> () -> @dynamic_self OptionalResult?, $@convention(method) (@guaranteed OptionalResult) -> @owned Optional<OptionalResult>
 // CHECK-NEXT: [[RES:%.*]] = apply [[T0]]([[CAST_BORROWED_ARG]])
+// CHECK-NEXT: end_borrow [[BORROWED_ARG]]
 // CHECK-NEXT: [[T4:%.*]] = unchecked_ref_cast [[RES]] : $Optional<OptionalResult> to $Optional<OptionalResultInheritor>
 
 func id<T>(_ t: T) -> T { return t }

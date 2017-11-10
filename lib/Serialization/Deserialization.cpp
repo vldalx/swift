@@ -439,9 +439,11 @@ SILLayout *ModuleFile::readSILLayout(llvm::BitstreamCursor &Cursor) {
   unsigned kind = Cursor.readRecord(next.ID, scratch);
   switch (kind) {
   case decls_block::SIL_LAYOUT: {
+    GenericSignatureID rawGenericSig;
     unsigned numFields;
     ArrayRef<uint64_t> types;
-    decls_block::SILLayoutLayout::readRecord(scratch, numFields, types);
+    decls_block::SILLayoutLayout::readRecord(scratch, rawGenericSig,
+                                             numFields, types);
     
     SmallVector<SILField, 4> fields;
     for (auto fieldInfo : types.slice(0, numFields)) {
@@ -452,20 +454,10 @@ SILLayout *ModuleFile::readSILLayout(llvm::BitstreamCursor &Cursor) {
                  isMutable));
     }
     
-    SmallVector<GenericTypeParamType*, 4> genericParams;
-    for (auto typeId : types.slice(numFields)) {
-      auto type = getType(typeId)->castTo<GenericTypeParamType>();
-      genericParams.push_back(type);
-    }
-    
-    SmallVector<Requirement, 4> requirements;
-    readGenericRequirements(requirements, DeclTypeCursor);
-    CanGenericSignature sig;
-    if (!genericParams.empty() || !requirements.empty()) {
-      sig = GenericSignature::get(genericParams, requirements)
-        ->getCanonicalSignature();
-    }
-    return SILLayout::get(getContext(), sig, fields);
+    CanGenericSignature canSig;
+    if (auto sig = getGenericSignature(rawGenericSig))
+      canSig = sig->getCanonicalSignature();
+    return SILLayout::get(getContext(), canSig, fields);
   }
   default:
     error();
@@ -920,6 +912,68 @@ void ModuleFile::configureGenericEnvironment(
   }
 }
 
+GenericSignature *ModuleFile::getGenericSignature(
+                                      serialization::GenericSignatureID ID) {
+  using namespace decls_block;
+
+  // Zero is a sentinel for having no generic signature.
+  if (ID == 0) return nullptr;
+
+  assert(ID <= GenericSignatures.size() && "invalid GenericSignature ID");
+  auto &sigOrOffset = GenericSignatures[ID-1];
+
+  // If we've already deserialized this generic signature, return it.
+  if (sigOrOffset.isComplete()) {
+    return sigOrOffset.get();
+  }
+
+  // Read the generic signature.
+  BCOffsetRAII restoreOffset(DeclTypeCursor);
+  DeclTypeCursor.JumpToBit(sigOrOffset);
+  DeserializingEntityRAII deserializingEntity(*this);
+
+  // Read the parameter types.
+  SmallVector<GenericTypeParamType *, 4> paramTypes;
+  StringRef blobData;
+  SmallVector<uint64_t, 8> scratch;
+
+  auto entry = DeclTypeCursor.advance(AF_DontPopBlockAtEnd);
+  if (entry.Kind != llvm::BitstreamEntry::Record) {
+    error();
+    return nullptr;
+  }
+
+  unsigned recordID = DeclTypeCursor.readRecord(entry.ID, scratch, &blobData);
+  if (recordID != GENERIC_SIGNATURE) {
+    error();
+    return nullptr;
+  }
+
+  ArrayRef<uint64_t> rawParamIDs;
+  GenericSignatureLayout::readRecord(scratch, rawParamIDs);
+
+  for (unsigned i = 0, n = rawParamIDs.size(); i != n; ++i) {
+    auto paramTy = getType(rawParamIDs[i])->castTo<GenericTypeParamType>();
+    paramTypes.push_back(paramTy);
+  }
+
+  // Read the generic requirements.
+  SmallVector<Requirement, 4> requirements;
+  readGenericRequirements(requirements, DeclTypeCursor);
+
+  // Construct the generic signature from the loaded parameters and
+  // requirements.
+  auto signature = GenericSignature::get(paramTypes, requirements);
+
+  // If we've already deserialized this generic signature, return it.
+  if (sigOrOffset.isComplete()) {
+    return sigOrOffset.get();
+  }
+
+  sigOrOffset = signature;
+  return signature;
+}
+
 llvm::PointerUnion<GenericSignature *, GenericEnvironment *>
 ModuleFile::getGenericSignatureOrEnvironment(
                                          serialization::GenericEnvironmentID ID,
@@ -940,13 +994,21 @@ ModuleFile::getGenericSignatureOrEnvironment(
     return envOrOffset.get();
   }
 
-  // Read the generic environment.
-  BCOffsetRAII restoreOffset(DeclTypeCursor);
-  DeclTypeCursor.JumpToBit(envOrOffset);
-  DeserializingEntityRAII deserializingEntity(*this);
+  // Extract the bit offset or generic signature ID.
+  uint64_t bitOffset = envOrOffset;
+  GenericSignature *signature = nullptr;
+  if (bitOffset & 0x01) {
+    // We have a generic signature ID.
+    signature = getGenericSignature(bitOffset >> 1);
+  } else {
+    bitOffset = bitOffset >> 1;
 
-  SmallVector<GenericTypeParamType *, 4> paramTypes;
-  {
+    // Read the generic environment.
+    BCOffsetRAII restoreOffset(DeclTypeCursor);
+    DeclTypeCursor.JumpToBit(bitOffset);
+    DeserializingEntityRAII deserializingEntity(*this);
+
+    SmallVector<GenericTypeParamType *, 4> paramTypes;
     using namespace decls_block;
 
     StringRef blobData;
@@ -963,71 +1025,54 @@ ModuleFile::getGenericSignatureOrEnvironment(
       return result;
 
     unsigned recordID = DeclTypeCursor.readRecord(entry.ID, scratch, &blobData);
-    switch (recordID) {
-    case GENERIC_ENVIRONMENT: {
-      lastRecordOffset.reset();
-
-      ArrayRef<uint64_t> rawParamIDs;
-      GenericEnvironmentLayout::readRecord(scratch, rawParamIDs);
-
-      for (unsigned i = 0, n = rawParamIDs.size(); i != n; ++i) {
-        auto paramTy = getType(rawParamIDs[i])->castTo<GenericTypeParamType>();
-        paramTypes.push_back(paramTy);
-      }
-      break;
-    }
-
-    case SIL_GENERIC_ENVIRONMENT: {
-      ArrayRef<uint64_t> rawParamIDs;
-      SILGenericEnvironmentLayout::readRecord(scratch, rawParamIDs);
-      lastRecordOffset.reset();
-
-      if (rawParamIDs.size() % 2 != 0) {
-        error();
-        return result;
-      }
-
-      for (unsigned i = 0, n = rawParamIDs.size(); i != n; i += 2) {
-        Identifier name = getIdentifier(rawParamIDs[i]);
-        auto paramTy = getType(rawParamIDs[i+1])->castTo<GenericTypeParamType>();
-
-        if (!name.empty()) {
-          auto paramDecl =
-            createDecl<GenericTypeParamDecl>(getAssociatedModule(),
-                                             name,
-                                             SourceLoc(),
-                                             paramTy->getDepth(),
-                                             paramTy->getIndex());
-          paramTy = paramDecl->getDeclaredInterfaceType()
-                     ->castTo<GenericTypeParamType>();
-        }
-
-        paramTypes.push_back(paramTy);
-      }
-      break;
-    }
-
-    default:
+    if (recordID != SIL_GENERIC_ENVIRONMENT) {
       error();
       return result;
     }
+
+    ArrayRef<uint64_t> rawParamIDs;
+    SILGenericEnvironmentLayout::readRecord(scratch, rawParamIDs);
+    lastRecordOffset.reset();
+
+    if (rawParamIDs.size() % 2 != 0) {
+      error();
+      return result;
+    }
+
+    for (unsigned i = 0, n = rawParamIDs.size(); i != n; i += 2) {
+      Identifier name = getIdentifier(rawParamIDs[i]);
+      auto paramTy = getType(rawParamIDs[i+1])->castTo<GenericTypeParamType>();
+
+      if (!name.empty()) {
+        auto paramDecl =
+          createDecl<GenericTypeParamDecl>(getAssociatedModule(),
+                                           name,
+                                           SourceLoc(),
+                                           paramTy->getDepth(),
+                                           paramTy->getIndex());
+        paramTy = paramDecl->getDeclaredInterfaceType()
+                   ->castTo<GenericTypeParamType>();
+      }
+
+      paramTypes.push_back(paramTy);
+    }
+
+    // If there are no parameters, the environment is empty.
+    if (paramTypes.empty()) {
+      if (wantEnvironment)
+        envOrOffset = nullptr;
+
+      return result;
+    }
+
+    // Read the generic requirements.
+    SmallVector<Requirement, 4> requirements;
+    readGenericRequirements(requirements, DeclTypeCursor);
+
+    // Construct the generic signature from the loaded parameters and
+    // requirements.
+    signature = GenericSignature::get(paramTypes, requirements);
   }
-
-  // If there are no parameters, the environment is empty.
-  if (paramTypes.empty()) {
-    if (wantEnvironment)
-      envOrOffset = nullptr;
-
-    return result;
-  }
-
-  // Read the generic requirements.
-  SmallVector<Requirement, 4> requirements;
-  readGenericRequirements(requirements, DeclTypeCursor);
-
-  // Construct the generic signature from the loaded parameters and
-  // requirements.
-  auto signature = GenericSignature::get(paramTypes, requirements);
 
   // If we only want the signature, return it now.
   if (!wantEnvironment) return signature;
@@ -1465,23 +1510,13 @@ ModuleFile::resolveCrossReference(ModuleDecl *baseModule, uint32_t pathLen) {
 
     case XREF_EXTENSION_PATH_PIECE: {
       ModuleID ownerID;
-      ArrayRef<uint64_t> genericParamIDs;
-      XRefExtensionPathPieceLayout::readRecord(scratch, ownerID,
-                                               genericParamIDs);
+      GenericSignatureID rawGenericSig;
+      XRefExtensionPathPieceLayout::readRecord(scratch, ownerID, rawGenericSig);
       M = getModule(ownerID);
       pathTrace.addExtension(M);
 
       // Read the generic signature, if we have one.
-      if (!genericParamIDs.empty()) {
-        SmallVector<GenericTypeParamType *, 4> params;
-        SmallVector<Requirement, 5> requirements;
-        for (TypeID paramID : genericParamIDs) {
-          params.push_back(getType(paramID)->castTo<GenericTypeParamType>());
-        }
-        readGenericRequirements(requirements, DeclTypeCursor);
-
-        genericSig = GenericSignature::getCanonical(params, requirements);
-      }
+      genericSig = CanGenericSignature(getGenericSignature(rawGenericSig));
 
       continue;
     }
@@ -2113,7 +2148,10 @@ ModuleFile::getDeclChecked(DeclID DID, Optional<DeclContext *> ForcedContext) {
   Expected<Decl *> deserialized = getDeclCheckedImpl(DID, ForcedContext);
   if (deserialized && deserialized.get()) {
     if (auto *IDC = dyn_cast<IterableDeclContext>(deserialized.get())) {
-      if (IDC->wasDeserialized()) {
+      // Only set the DeclID on the returned Decl if it's one that was loaded
+      // and _wasn't_ one that had its DeclID set elsewhere (a followed XREF).
+      if (IDC->wasDeserialized() &&
+          static_cast<uint32_t>(IDC->getDeclID()) == 0) {
         IDC->setDeclID(DID);
       }
     }
@@ -3771,6 +3809,26 @@ getActualSILFunctionTypeRepresentation(uint8_t rep) {
   }
 }
 
+/// Translate from the Serialization coroutine kind enum values to the AST
+/// strongly-typed enum.
+///
+/// The former is guaranteed to be stable, but may not reflect this version of
+/// the AST.
+static Optional<swift::SILCoroutineKind>
+getActualSILCoroutineKind(uint8_t rep) {
+  switch (rep) {
+#define CASE(KIND) \
+  case (uint8_t)serialization::SILCoroutineKind::KIND: \
+    return swift::SILCoroutineKind::KIND;
+  CASE(None)
+  CASE(YieldOnce)
+  CASE(YieldMany)
+#undef CASE
+  default:
+    return None;
+  }
+}
+
 /// Translate from the serialization Ownership enumerators, which are
 /// guaranteed to be stable, to the AST ones.
 static
@@ -4248,40 +4306,23 @@ Expected<Type> ModuleFile::getTypeChecked(TypeID TID) {
     TypeID resultID;
     uint8_t rawRep;
     bool throws = false;
-    ArrayRef<uint64_t> genericParamIDs;
+    GenericSignatureID rawGenericSig;
 
     decls_block::GenericFunctionTypeLayout::readRecord(scratch,
                                                        inputID,
                                                        resultID,
                                                        rawRep,
                                                        throws,
-                                                       genericParamIDs);
+                                                       rawGenericSig);
     auto rep = getActualFunctionTypeRepresentation(rawRep);
     if (!rep.hasValue()) {
       error();
       return nullptr;
     }
 
-    // Read the generic parameters.
-    SmallVector<GenericTypeParamType *, 4> genericParams;
-    for (auto paramID : genericParamIDs) {
-      auto param = dyn_cast_or_null<GenericTypeParamType>(
-                     getType(paramID).getPointer());
-      if (!param) {
-        error();
-        break;
-      }
-
-      genericParams.push_back(param);
-    }
-    
-    // Read the generic requirements.
-    SmallVector<Requirement, 4> requirements;
-    readGenericRequirements(requirements, DeclTypeCursor);
+    auto sig = getGenericSignature(rawGenericSig);
     auto info = GenericFunctionType::ExtInfo(*rep, throws);
-
-    auto sig = GenericSignature::get(genericParams, requirements);
-
+    
     auto inputTy = getTypeChecked(inputID);
     if (!inputTy)
       return inputTy.takeError();
@@ -4354,23 +4395,29 @@ Expected<Type> ModuleFile::getTypeChecked(TypeID TID) {
   }
       
   case decls_block::SIL_FUNCTION_TYPE: {
+    uint8_t rawCoroutineKind;
     uint8_t rawCalleeConvention;
     uint8_t rawRepresentation;
     bool pseudogeneric = false;
     bool noescape;
     bool hasErrorResult;
     unsigned numParams;
+    unsigned numYields;
     unsigned numResults;
+    GenericSignatureID rawGenericSig;
     ArrayRef<uint64_t> variableData;
 
     decls_block::SILFunctionTypeLayout::readRecord(scratch,
+                                             rawCoroutineKind,
                                              rawCalleeConvention,
                                              rawRepresentation,
                                              pseudogeneric,
                                              noescape,
                                              hasErrorResult,
                                              numParams,
+                                             numYields,
                                              numResults,
+                                             rawGenericSig,
                                              variableData);
 
     // Process the ExtInfo.
@@ -4381,6 +4428,13 @@ Expected<Type> ModuleFile::getTypeChecked(TypeID TID) {
       return nullptr;
     }
     SILFunctionType::ExtInfo extInfo(*representation, pseudogeneric, noescape);
+
+    // Process the coroutine kind.
+    auto coroutineKind = getActualSILCoroutineKind(rawCoroutineKind);
+    if (!coroutineKind.hasValue()) {
+      error();
+      return nullptr;
+    }
 
     // Process the callee convention.
     auto calleeConvention = getActualParameterConvention(rawCalleeConvention);
@@ -4395,6 +4449,14 @@ Expected<Type> ModuleFile::getTypeChecked(TypeID TID) {
       auto type = getType(typeID);
       if (!convention || !type) return None;
       return SILParameterInfo(type->getCanonicalType(), *convention);
+    };
+
+    auto processYield = [&](TypeID typeID, uint64_t rawConvention)
+                                  -> Optional<SILYieldInfo> {
+      auto convention = getActualParameterConvention(rawConvention);
+      auto type = getType(typeID);
+      if (!convention || !type) return None;
+      return SILYieldInfo(type->getCanonicalType(), *convention);
     };
 
     auto processResult = [&](TypeID typeID, uint64_t rawConvention)
@@ -4428,6 +4490,20 @@ Expected<Type> ModuleFile::getTypeChecked(TypeID TID) {
       allParams.push_back(*param);
     }
 
+    // Process the yields.
+    SmallVector<SILYieldInfo, 8> allYields;
+    allYields.reserve(numYields);
+    for (unsigned i = 0; i != numYields; ++i) {
+      auto typeID = variableData[nextVariableDataIndex++];
+      auto rawConvention = variableData[nextVariableDataIndex++];
+      auto yield = processYield(typeID, rawConvention);
+      if (!yield) {
+        error();
+        return nullptr;
+      }
+      allYields.push_back(*yield);
+    }
+
     // Process the results.
     SmallVector<SILResultInfo, 8> allResults;
     allParams.reserve(numResults);
@@ -4454,30 +4530,19 @@ Expected<Type> ModuleFile::getTypeChecked(TypeID TID) {
       }
     }
 
-    // Process the generic signature parameters.
-    SmallVector<GenericTypeParamType *, 8> genericParamTypes;
-    for (auto id : variableData.slice(nextVariableDataIndex)) {
-      genericParamTypes.push_back(
-                  cast<GenericTypeParamType>(getType(id)->getCanonicalType()));
-    }
-
     Optional<ProtocolConformanceRef> witnessMethodConformance;
     if (*representation == SILFunctionTypeRepresentation::WitnessMethod) {
       witnessMethodConformance = readConformance(DeclTypeCursor);
     }
 
-    // Read the generic requirements, if any.
-    SmallVector<Requirement, 4> requirements;
-    readGenericRequirements(requirements, DeclTypeCursor);
+    GenericSignature *genericSig = getGenericSignature(rawGenericSig);
 
-    GenericSignature *genericSig = nullptr;
-    if (!genericParamTypes.empty() || !requirements.empty())
-      genericSig = GenericSignature::get(genericParamTypes, requirements,
-                                         /*isKnownCanonical=*/true);
-
-    typeOrOffset = SILFunctionType::get(
-        genericSig, extInfo, calleeConvention.getValue(), allParams, allResults,
-        errorResult, ctx, witnessMethodConformance);
+    typeOrOffset = SILFunctionType::get(genericSig, extInfo,
+                                        coroutineKind.getValue(),
+                                        calleeConvention.getValue(),
+                                        allParams, allYields, allResults,
+                                        errorResult,
+                                        ctx, witnessMethodConformance);
     break;
   }
 
@@ -4891,21 +4956,7 @@ void ModuleFile::finishNormalConformance(NormalProtocolConformance *conformance,
 
     // Requirement -> synthetic map.
     SmallVector<Substitution, 4> reqToSyntheticSubs;
-    if (unsigned numGenericParams = *rawIDIter++) {
-      // Generic parameters of the synthetic environment.
-      SmallVector<GenericTypeParamType *, 2> genericParams;
-      while (numGenericParams--) {
-        genericParams.push_back(
-          getType(*rawIDIter++)->castTo<GenericTypeParamType>());
-      }
-
-      // Generic requirements of the synthetic environment.
-      SmallVector<Requirement, 4> requirements;
-      readGenericRequirements(requirements, DeclTypeCursor);
-
-      // Form the generic signature for the synthetic environment.
-      syntheticSig = GenericSignature::get(genericParams, requirements);
-
+    if (auto syntheticSig = getGenericSignature(*rawIDIter++)) {
       // Create the synthetic environment.
       syntheticEnv = syntheticSig->createGenericEnvironment();
 

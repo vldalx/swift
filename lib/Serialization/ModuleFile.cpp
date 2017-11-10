@@ -16,6 +16,7 @@
 #include "swift/Subsystems.h"
 #include "swift/AST/ASTContext.h"
 #include "swift/AST/ASTMangler.h"
+#include "swift/AST/GenericSignature.h"
 #include "swift/AST/ModuleLoader.h"
 #include "swift/AST/NameLookup.h"
 #include "swift/AST/USRGeneration.h"
@@ -841,6 +842,10 @@ bool ModuleFile::readIndexBlock(llvm::BitstreamCursor &cursor) {
       case index_block::LOCAL_DECL_CONTEXT_OFFSETS:
         assert(blobData.empty());
         LocalDeclContexts.assign(scratch.begin(), scratch.end());
+        break;
+      case index_block::GENERIC_SIGNATURE_OFFSETS:
+        assert(blobData.empty());
+        GenericSignatures.assign(scratch.begin(), scratch.end());
         break;
       case index_block::GENERIC_ENVIRONMENT_OFFSETS:
         assert(blobData.empty());
@@ -2168,6 +2173,17 @@ void ModuleFile::verify() const {
 
 bool SerializedASTFile::hasEntryPoint() const {
   return File.Bits.HasEntryPoint;
+}
+
+bool SerializedASTFile::getAllGenericSignatures(
+                       SmallVectorImpl<GenericSignature*> &genericSignatures) {
+  genericSignatures.clear();
+  for (unsigned index : indices(File.GenericSignatures)) {
+    if (auto genericSig = File.getGenericSignature(index + 1))
+      genericSignatures.push_back(genericSig);
+  }
+
+  return true;
 }
 
 ClassDecl *SerializedASTFile::getMainClass() const {

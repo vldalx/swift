@@ -798,15 +798,10 @@ public:
     }
     case MetadataKind::Function: {
       auto Function = cast<TargetFunctionTypeMetadata<Runtime>>(Meta);
-      auto *const parameters = Function->getParameters();
 
       std::vector<FunctionParam<BuiltType>> Parameters;
       for (unsigned i = 0, n = Function->getNumParameters(); i != n; ++i) {
-        StoredPointer ParamMetadata;
-        if (!Reader->readInteger(RemoteAddress(parameters + i), &ParamMetadata))
-          return BuiltType();
-
-        auto ParamTypeRef = readTypeFromMetadata(ParamMetadata);
+        auto ParamTypeRef = readTypeFromMetadata(Function->getParameter(i));
         if (!ParamTypeRef)
           return BuiltType();
 
@@ -1197,8 +1192,10 @@ protected:
         auto flags =
             TargetFunctionTypeFlags<StoredSize>::fromIntValue(flagsValue);
 
+        using Parameter =
+            ConstTargetMetadataPointer<Runtime, swift::TargetMetadata>;
         auto totalSize = sizeof(TargetFunctionTypeMetadata<Runtime>) +
-                         flags.getNumParameters() * sizeof(StoredPointer);
+                         flags.getNumParameters() * sizeof(Parameter);
 
         if (flags.hasParameterFlags())
           totalSize += flags.getNumParameters() * sizeof(uint32_t);

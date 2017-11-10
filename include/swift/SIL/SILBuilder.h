@@ -1617,6 +1617,18 @@ public:
         new (getModule()) ThrowInst(getSILDebugLocation(Loc), errorValue));
   }
 
+  UnwindInst *createUnwind(SILLocation loc) {
+    return insertTerminator(
+        new (getModule()) UnwindInst(getSILDebugLocation(loc)));
+  }
+
+  YieldInst *createYield(SILLocation loc, ArrayRef<SILValue> yieldedValues,
+                         SILBasicBlock *resumeBB, SILBasicBlock *unwindBB) {
+    return insertTerminator(
+        YieldInst::create(getSILDebugLocation(loc), yieldedValues,
+                          resumeBB, unwindBB, getFunction()));
+  }
+
   CondBranchInst *
   createCondBranch(SILLocation Loc, SILValue Cond, SILBasicBlock *Target1,
                    SILBasicBlock *Target2,
@@ -2034,6 +2046,35 @@ public:
                                SILInstruction *InheritScopeFrom)
       : SILBuilder(BB) {
     inheritScopeFrom(InheritScopeFrom);
+  }
+};
+
+class SavedInsertionPointRAII {
+  SILBuilder &Builder;
+  PointerUnion<SILInstruction *, SILBasicBlock *> SavedIP;
+
+public:
+  SavedInsertionPointRAII(SILBuilder &B, SILInstruction *NewIP)
+      : Builder(B), SavedIP(&*B.getInsertionPoint()) {
+    Builder.setInsertionPoint(NewIP);
+  }
+
+  SavedInsertionPointRAII(SILBuilder &B, SILBasicBlock *NewIP)
+      : Builder(B), SavedIP(B.getInsertionBB()) {
+    Builder.setInsertionPoint(NewIP);
+  }
+
+  SavedInsertionPointRAII(const SavedInsertionPointRAII &) = delete;
+  SavedInsertionPointRAII &operator=(const SavedInsertionPointRAII &) = delete;
+  SavedInsertionPointRAII(SavedInsertionPointRAII &&) = delete;
+  SavedInsertionPointRAII &operator=(SavedInsertionPointRAII &&) = delete;
+
+  ~SavedInsertionPointRAII() {
+    if (SavedIP.is<SILInstruction *>()) {
+      Builder.setInsertionPoint(SavedIP.get<SILInstruction *>());
+    } else {
+      Builder.setInsertionPoint(SavedIP.get<SILBasicBlock *>());
+    }
   }
 };
 

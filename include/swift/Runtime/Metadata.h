@@ -1745,7 +1745,7 @@ using EnumMetadata = TargetEnumMetadata<InProcess>;
 template <typename Runtime>
 struct TargetFunctionTypeMetadata : public TargetMetadata<Runtime> {
   using StoredSize = typename Runtime::StoredSize;
-  using Parameter = const TargetMetadata<Runtime> *;
+  using Parameter = ConstTargetMetadataPointer<Runtime, swift::TargetMetadata>;
 
   TargetFunctionTypeFlags<StoredSize> Flags;
 
@@ -1756,6 +1756,11 @@ struct TargetFunctionTypeMetadata : public TargetMetadata<Runtime> {
 
   const Parameter *getParameters() const {
     return reinterpret_cast<const Parameter *>(this + 1);
+  }
+
+  Parameter getParameter(unsigned index) const {
+    assert(index < getNumParameters());
+    return getParameters()[index];
   }
 
   ParameterFlags getParameterFlags(unsigned index) const {
